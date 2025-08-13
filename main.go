@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
 	paths "path"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -179,6 +182,7 @@ func compile() {
 func render[T any](w http.ResponseWriter, r *http.Request, query *query, entries []T) {
 	w.Header().Set("Cache-Control", "max-age=30, public")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
 	// only actually render on GET requests
 	if r.Method == "GET" {
 		// prepare the options for the index page template
@@ -300,8 +304,12 @@ func serve(w http.ResponseWriter, r *http.Request) {
 			render(w, r, &query, entries)
 		}
 	} else {
+		w.Header().Set("Content-Type", mime.TypeByExtension(filepath.Ext(stat.Name())))
+		w.Header().Set("Content-Length", strconv.FormatInt(stat.Size(), 10))
+		w.Header().Set("Last-Modified", stat.ModTime().UTC().Format(http.TimeFormat))
 		w.Header().Set("Cache-Control", "max-age=30, must-revalidate, public")
-		http.ServeContent(w, r, stat.Name(), stat.ModTime(), file)
+		w.WriteHeader(http.StatusOK)
+		file.WriteTo(w)
 	}
 }
 
