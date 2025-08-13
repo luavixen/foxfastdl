@@ -22,6 +22,8 @@ import (
 )
 
 var (
+	// magic password header value or empty string if not set
+	password string
 	// list of directories that are allowed to be accessed
 	directories []string
 	// list of servers that are proxied
@@ -258,6 +260,12 @@ func serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// check if the password is set and the header is correct
+	if password != "" && r.Header.Get("X-Foxfastdl-Password") != password {
+		sendErrorCode(w, http.StatusForbidden)
+		return
+	}
+
 	// resolve the request path into a query object
 	query := resolve(r.URL.Path)
 
@@ -304,11 +312,17 @@ func serve(w http.ResponseWriter, r *http.Request) {
 			render(w, r, &query, entries)
 		}
 	} else {
-		w.Header().Set("Content-Type", mime.TypeByExtension(filepath.Ext(stat.Name())))
+		// write headers based on the file's metadata
+		if t := mime.TypeByExtension(filepath.Ext(stat.Name())); t != "" {
+			w.Header().Set("Content-Type", t)
+		} else {
+			w.Header().Set("Content-Type", "application/octet-stream")
+		}
 		w.Header().Set("Content-Length", strconv.FormatInt(stat.Size(), 10))
 		w.Header().Set("Last-Modified", stat.ModTime().UTC().Format(http.TimeFormat))
 		w.Header().Set("Cache-Control", "max-age=30, must-revalidate, public")
 		w.WriteHeader(http.StatusOK)
+		// write the file's data to the response
 		file.WriteTo(w)
 	}
 }
@@ -323,9 +337,11 @@ func env(k string, d string) string {
 }
 
 func main() {
+	log.SetFlags(0)
 	log.Println("foxfastdl v0.2.0 (c) 2025 Lua MacDougall <lua@foxgirl.dev>")
 	compile()
 	godotenv.Load()
+	password = env("FASTDL_PASSWORD", "")
 	directories = strings.Split(env("FASTDL_PATHS", "maps,materials,models,sound,particles,scripts,resource"), ",")
 	servers = make([]*server, 0, 10)
 	defer func() {
