@@ -14,6 +14,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -34,27 +36,151 @@ var (
 
 // represents a server that we are proxying files from
 type server struct {
-	name string      // name of the server, used in the url
-	url *url.URL     // sftp:// url of the server
+	url  *url.URL // url of the server, like sftp://user:pass@host:port/path?name=NAME
+	name string   // name of the server taken from the url
+
+	mu   sync.Mutex // mutex protecting the `conn` field
+	conn *conn      // current connection to the server, or nil
+}
+
+// represents an open sftp connection to a server
+type conn struct {
 	ssh *ssh.Client  // ssh connection to the server
 	ftp *sftp.Client // sftp connection to the server
 }
 
-// closes the server's connections
-func (s *server) close() error {
-	ftpErr := s.ftp.Close()
-	sshErr := s.ssh.Close()
+// closes the connection
+func (c *conn) close() error {
+	ftpErr := c.ftp.Close()
+	sshErr := c.ssh.Close()
 	return errors.Join(ftpErr, sshErr)
 }
 
+// closes the server's connections
+func (s *server) close() error {
+	// lock the mutex
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// close the connection if present
+	if s.conn != nil {
+		return s.conn.close()
+	} else {
+		return nil
+	}
+}
+
+// opens a new connection to the server without saving or persisting it
+func (s *server) dial() (*conn, error) {
+	u := s.url
+	host := u.Host
+	user := u.User.Username()
+	pass, _ := u.User.Password()
+	cfg := ssh.ClientConfig{
+		User: user,
+		Auth: []ssh.AuthMethod{ssh.Password(pass)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout: 10 * time.Second,
+	}
+	ssh, err := ssh.Dial("tcp", host, &cfg)
+	if err != nil {
+		return nil, fmt.Errorf("dial failed %s: %w", s.name, err)
+	}
+	ftp, err := sftp.NewClient(ssh)
+	if err != nil {
+		return nil, fmt.Errorf("sftp failed %s: %w", s.name, err)
+	}
+	return &conn{ssh, ftp}, nil
+}
+
+// gets a connection to the server
+// - if the server does not have a connection: a new connection will be opened
+// - if the server already has a connection, and it is equal to the one provided: it will be closed, and a new connection will be opened
+// - if the server already has a connection, and it is not equal to the one provided: it will be returned
+func (s *server) connect(not *conn) (*conn, error) {
+	// lock the mutex
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// check if the server already has a connection
+	if s.conn != nil {
+		// if the connection is not equal to the one provided, return it
+		if s.conn != not {
+			return s.conn, nil
+		}
+		// if the connection is equal to the one provided, close it
+		s.conn.close()
+		s.conn = nil
+	}
+	// open a new connection
+	c, err := s.dial()
+	if err != nil {
+		return nil, err
+	} else {
+		s.conn = c
+		return c, nil
+	}
+}
+
+// returns true if the error indicates that the connection was lost
+func wasConnLost(err error) bool {
+	return (
+		errors.Is(err, syscall.ECONNABORTED) ||   // connection aborted
+		errors.Is(err, syscall.ECONNRESET)   ||   // connection reset by peer
+		errors.Is(err, syscall.ECONNREFUSED) ||   // connection refused
+		errors.Is(err, syscall.ETIMEDOUT)    ||   // connection timed out
+		errors.Is(err, syscall.EPIPE)        ||   // broken pipe
+		errors.Is(err, syscall.ENOTCONN)     ||   // socket is not connected
+		errors.Is(err, syscall.ENOTSOCK)     ||   // not a socket
+		errors.Is(err, syscall.EHOSTUNREACH) ||   // no route to host
+		errors.Is(err, syscall.EHOSTDOWN)    ||   // host is down
+		errors.Is(err, syscall.ENETUNREACH)  ||   // network is unreachable
+		errors.Is(err, syscall.ENETDOWN)     ||   // network is down
+		errors.Is(err, syscall.ENETRESET)    ||   // network dropped connection
+		errors.Is(err, syscall.ENODEV)       ||   // no such device
+		errors.Is(err, syscall.ENFILE)       )    // too many open files in system
+}
+
+// performs an action with a connection to the server
+// THE ACTION MUST BE IDEMPOTENT
+// THE ACTION MAY BE CALLED ZERO, ONE, OR TWO TIMES
+func (s *server) perform(f func(*conn) error) error {
+	a, err := s.connect(nil)
+	if err != nil {
+		return err
+	} else {
+		err := f(a)
+		if err != nil {
+			if wasConnLost(err) {
+				b, err := s.connect(a)
+				if err != nil {
+					return err
+				} else {
+					return f(b)
+				}
+			} else {
+				return err
+			}
+		} else {
+			return nil
+		}
+	}
+}
+
 // opens a file for reading
-func (s *server) open(path string) (*sftp.File, error) {
-	return s.ftp.Open(path)
+func (s *server) open(path string) (f *sftp.File, err error) {
+	err = s.perform(func(c *conn) error {
+		f, err = c.ftp.Open(path)
+		return err
+	})
+	return
 }
 
 // lists the contents of a directory
-func (s *server) list(path string) ([]os.FileInfo, error) {
-	return s.ftp.ReadDir(path)
+func (s *server) list(path string) (e []os.FileInfo, err error) {
+	err = s.perform(func(c *conn) error {
+		e, err = c.ftp.ReadDir(path)
+		return err
+	})
+	return
 }
 
 // represents a user's query for a server's file or directory
@@ -344,6 +470,7 @@ func main() {
 	password = env("FASTDL_PASSWORD", "")
 	directories = strings.Split(env("FASTDL_PATHS", "maps,materials,models,sound,particles,scripts,resource"), ",")
 	servers = make([]*server, 0, 10)
+	failures := 0
 	defer func() {
 		for _, s := range servers {
 			s.close()
@@ -356,38 +483,30 @@ func main() {
 		u, err := url.Parse(v)
 		if err != nil {
 			log.Printf("invalid %s: %v\n", k, err)
+			failures++
+			continue
 		}
 		if u.Scheme != "sftp" {
 			log.Printf("invalid scheme for %s, expected sftp\n", k)
+			failures++
 			continue
 		}
 		n := u.Query().Get("name")
 		if n == "" {
 			n = u.Hostname()
 		}
-		host := u.Host
-		user := u.User.Username()
-		pass, _ := u.User.Password()
-		cfg := ssh.ClientConfig{
-			User: user,
-			Auth: []ssh.AuthMethod{ssh.Password(pass)},
-			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-			Timeout: 10 * time.Second,
+		s := &server{name: n, url: u}
+		if _, err := s.connect(nil); err != nil {
+			log.Printf("failed to connect to %s: %v\n", n, err)
+			failures++
+			continue
 		}
-		ssh, err := ssh.Dial("tcp", host, &cfg)
-		if err != nil {
-			log.Printf("dial failed %s: %v\n", n, err)
-			time.Sleep(3 * time.Second)
-			return
-		}
-		ftp, err := sftp.NewClient(ssh)
-		if err != nil {
-			log.Printf("sftp failed %s: %v\n", n, err)
-			time.Sleep(3 * time.Second)
-			return
-		}
-		servers = append(servers, &server{name: n, url: u, ssh: ssh, ftp: ftp})
+		servers = append(servers, s)
 		log.Printf("connected %s at %s\n", n, u.Host)
+	}
+	if failures > 0 {
+		log.Printf("failed to connect to %d servers\n", failures)
+		return
 	}
 	bind := env("FASTDL_BIND", ":8080")
 	log.Printf("listening on %s\n", bind)
