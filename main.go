@@ -123,20 +123,25 @@ func (s *server) connect(not *conn) (*conn, error) {
 // returns true if the error indicates that the connection was lost
 func wasConnLost(err error) bool {
 	return (
-		errors.Is(err, syscall.ECONNABORTED) ||   // connection aborted
-		errors.Is(err, syscall.ECONNRESET)   ||   // connection reset by peer
-		errors.Is(err, syscall.ECONNREFUSED) ||   // connection refused
-		errors.Is(err, syscall.ETIMEDOUT)    ||   // connection timed out
-		errors.Is(err, syscall.EPIPE)        ||   // broken pipe
-		errors.Is(err, syscall.ENOTCONN)     ||   // socket is not connected
-		errors.Is(err, syscall.ENOTSOCK)     ||   // not a socket
-		errors.Is(err, syscall.EHOSTUNREACH) ||   // no route to host
-		errors.Is(err, syscall.EHOSTDOWN)    ||   // host is down
-		errors.Is(err, syscall.ENETUNREACH)  ||   // network is unreachable
-		errors.Is(err, syscall.ENETDOWN)     ||   // network is down
-		errors.Is(err, syscall.ENETRESET)    ||   // network dropped connection
-		errors.Is(err, syscall.ENODEV)       ||   // no such device
-		errors.Is(err, syscall.ENFILE)       )    // too many open files in system
+		errors.Is(err, sftp.ErrSSHFxFailure)        ||
+		errors.Is(err, sftp.ErrSSHFxBadMessage)     ||
+		errors.Is(err, sftp.ErrSSHFxNoConnection)   ||
+		errors.Is(err, sftp.ErrSSHFxConnectionLost) ||
+		errors.Is(err, syscall.ECONNABORTED)        ||   // connection aborted
+		errors.Is(err, syscall.ECONNRESET)          ||   // connection reset by peer
+		errors.Is(err, syscall.ECONNREFUSED)        ||   // connection refused
+		errors.Is(err, syscall.ETIMEDOUT)           ||   // connection timed out
+		errors.Is(err, syscall.EPIPE)               ||   // broken pipe
+		errors.Is(err, syscall.ENOTCONN)            ||   // socket is not connected
+		errors.Is(err, syscall.ENOTSOCK)            ||   // not a socket
+		errors.Is(err, syscall.EHOSTUNREACH)        ||   // no route to host
+		errors.Is(err, syscall.EHOSTDOWN)           ||   // host is down
+		errors.Is(err, syscall.ENETUNREACH)         ||   // network is unreachable
+		errors.Is(err, syscall.ENETDOWN)            ||   // network is down
+		errors.Is(err, syscall.ENETRESET)           ||   // network dropped connection
+		errors.Is(err, syscall.ENODEV)              ||   // no such device
+		errors.Is(err, syscall.ENFILE)              ||   // too many open files in system
+		strings.Contains(err.Error(), "connection"))
 }
 
 // performs an action with a connection to the server
