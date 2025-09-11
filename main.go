@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	paths "path"
 	"path/filepath"
 	"slices"
@@ -43,8 +44,10 @@ type server struct {
 
 	ctx context.Context // server deadline
 
-	mu   sync.Mutex // mutex protecting the `conn` field
-	conn *conn      // current connection to the server, or nil
+	connmu sync.Mutex // mutex protecting the `conn` field
+	conn   *conn      // current connection to the server, or nil
+
+	performmu sync.Mutex // mutex protecting the `perform` metho
 }
 
 // represents an open sftp connection to a server
@@ -63,8 +66,8 @@ func (c *conn) close() error {
 // closes the server's connections
 func (s *server) close() error {
 	// lock the mutex
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.connmu.Lock()
+	defer s.connmu.Unlock()
 	// close the connection if present
 	if s.conn != nil {
 		return s.conn.close()
@@ -107,8 +110,8 @@ func (s *server) connect(not *conn) (*conn, error) {
 		return nil, err
 	}
 	// lock the mutex
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.connmu.Lock()
+	defer s.connmu.Unlock()
 	// check if the server already has a connection
 	if s.conn != nil {
 		// if the connection is not equal to the one provided, return it
@@ -153,27 +156,55 @@ func wasConnLost(err error) bool {
 		strings.Contains(err.Error(), "connection"))
 }
 
+// sleeps for a duration
+// returns true if the duration elapsed, false if the context was canceled
+func sleep(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false // canceled
+	case <-time.After(d):
+		return true // completed normally
+	}
+}
+
 // performs an action with a connection to the server
 // THE ACTION MUST BE IDEMPOTENT
 // THE ACTION MAY BE CALLED ZERO, ONE, OR TWO TIMES
 func (s *server) perform(f func(*conn) error) error {
+	// lock the mutex
+	s.performmu.Lock()
+	defer s.performmu.Unlock()
+	// get a connection to the server
 	a, err := s.connect(nil)
 	if err != nil {
+		// connect failed, return immediately
+		log.Printf("connect failed %s: %v\n", s.name, err)
 		return err
 	} else {
+		// perform the action
 		err := f(a)
 		if err != nil {
+			// check if the connection was lost
 			if wasConnLost(err) {
+				log.Printf("reconnecting %s: %v\n", s.name, err)
+				// take a breather
+				sleep(s.ctx, 5*time.Second)
+				// attempt to reconnect to the server
 				b, err := s.connect(a)
 				if err != nil {
+					// reconnect failed, return the error
+					log.Printf("reconnect failed %s: %v\n", s.name, err)
 					return err
 				} else {
+					// reconnect succeeded, try and perform the action a second time
 					return f(b)
 				}
 			} else {
+				// action failed, return the error
 				return err
 			}
 		} else {
+			// everything went well, return nil :D
 			return nil
 		}
 	}
@@ -208,7 +239,7 @@ func (s *server) monitor(d time.Duration, cancel context.CancelCauseFunc) {
 			cancel(err)
 			return
 		}
-		time.Sleep(d)
+		sleep(s.ctx, d)
 	}
 }
 
@@ -506,11 +537,13 @@ func main() {
 	servers = make([]*server, 0, 10)
 	failures := 0
 	ctx, cancel := context.WithCancelCause(context.Background())
-	defer cancel(nil)
-	defer func() {
-		for _, s := range servers {
-			s.close()
-		}
+	defer cancel(errors.New("exited"))
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-signals
+		fmt.Println("\ninterrupted, stopping...")
+		cancel(errors.New("interrupted"))
 	}()
 	for i := range ^uint(0) {
 		k := fmt.Sprintf("FASTDL_SERVER%d", i+1)
@@ -537,6 +570,7 @@ func main() {
 			failures++
 			continue
 		}
+		context.AfterFunc(ctx, func() { go s.close() })
 		servers = append(servers, s)
 		log.Printf("connected %s at %s\n", n, u.Host)
 	}
@@ -556,6 +590,13 @@ func main() {
 		Handler: http.HandlerFunc(serve),
 		BaseContext: func(l net.Listener) context.Context { return ctx },
 	}
+	context.AfterFunc(ctx, func() {
+		go h.Shutdown(ctx)
+		time.Sleep(5*time.Second)
+		go h.Close()
+		time.Sleep(1*time.Second)
+		os.Exit(1)
+	})
 	if err := h.ListenAndServe(); err != nil {
 		log.Printf("listen failed: %v\n", err)
 		time.Sleep(3*time.Second)
