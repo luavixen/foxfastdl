@@ -44,10 +44,8 @@ type server struct {
 
 	ctx context.Context // server deadline
 
-	connmu sync.Mutex // mutex protecting the `conn` field
-	conn   *conn      // current connection to the server, or nil
-
-	performmu sync.Mutex // mutex protecting the `perform` metho
+	mu sync.Mutex // mutex protecting the `conn` field
+	conn   *conn  // current connection to the server, or nil
 }
 
 // represents an open sftp connection to a server
@@ -66,8 +64,8 @@ func (c *conn) close() error {
 // closes the server's connections
 func (s *server) close() error {
 	// lock the mutex
-	s.connmu.Lock()
-	defer s.connmu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	// close the connection if present
 	if s.conn != nil {
 		return s.conn.close()
@@ -110,8 +108,8 @@ func (s *server) connect(not *conn) (*conn, error) {
 		return nil, err
 	}
 	// lock the mutex
-	s.connmu.Lock()
-	defer s.connmu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	// check if the server already has a connection
 	if s.conn != nil {
 		// if the connection is not equal to the one provided, return it
@@ -171,9 +169,6 @@ func sleep(ctx context.Context, d time.Duration) bool {
 // THE ACTION MUST BE IDEMPOTENT
 // THE ACTION MAY BE CALLED ZERO, ONE, OR TWO TIMES
 func (s *server) perform(f func(*conn) error) error {
-	// lock the mutex
-	s.performmu.Lock()
-	defer s.performmu.Unlock()
 	// get a connection to the server
 	a, err := s.connect(nil)
 	if err != nil {
@@ -186,14 +181,13 @@ func (s *server) perform(f func(*conn) error) error {
 		if err != nil {
 			// check if the connection was lost
 			if wasConnLost(err) {
-				log.Printf("reconnecting %s: %v\n", s.name, err)
 				// take a breather
 				sleep(s.ctx, 5*time.Second)
 				// attempt to reconnect to the server
 				b, err := s.connect(a)
 				if err != nil {
 					// reconnect failed, return the error
-					log.Printf("reconnect failed %s: %v\n", s.name, err)
+					log.Printf("connect failed %s: %v\n", s.name, err)
 					return err
 				} else {
 					// reconnect succeeded, try and perform the action a second time
