@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"html/template"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -39,6 +41,8 @@ type server struct {
 	url  *url.URL // url of the server, like sftp://user:pass@host:port/path?name=NAME
 	name string   // name of the server taken from the url
 
+	ctx context.Context // server deadline
+
 	mu   sync.Mutex // mutex protecting the `conn` field
 	conn *conn      // current connection to the server, or nil
 }
@@ -70,6 +74,7 @@ func (s *server) close() error {
 }
 
 // opens a new connection to the server without saving or persisting it
+// should only be called by server.connect
 func (s *server) dial() (*conn, error) {
 	u := s.url
 	host := u.Host
@@ -97,6 +102,10 @@ func (s *server) dial() (*conn, error) {
 // - if the server already has a connection, and it is equal to the one provided: it will be closed, and a new connection will be opened
 // - if the server already has a connection, and it is not equal to the one provided: it will be returned
 func (s *server) connect(not *conn) (*conn, error) {
+	// check the server's deadline
+	if err := s.ctx.Err(); err != nil {
+		return nil, err
+	}
 	// lock the mutex
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -186,6 +195,21 @@ func (s *server) list(path string) (e []os.FileInfo, err error) {
 		return err
 	})
 	return
+}
+
+// monitors the server's connection by listing the root directory in a loop
+// if the listing fails, the cancel function is called with the error
+func (s *server) monitor(d time.Duration, cancel context.CancelCauseFunc) {
+	for {
+		_, err := s.list("")
+		if err != nil {
+			err = fmt.Errorf("monitor failed %s: %w", s.name, err)
+			log.Printf("%s\n", err)
+			cancel(err)
+			return
+		}
+		time.Sleep(d)
+	}
 }
 
 // represents a user's query for a server's file or directory
@@ -469,13 +493,20 @@ func env(k string, d string) string {
 
 func main() {
 	log.SetFlags(0)
-	log.Println("foxfastdl v0.2.0 (c) 2025 Lua MacDougall <lua@foxgirl.dev>")
+	log.Println("foxfastdl v0.3.0 (c) 2025 Lua MacDougall <lua@foxgirl.dev>")
 	compile()
 	godotenv.Load()
 	password = env("FASTDL_PASSWORD", "")
-	directories = strings.Split(env("FASTDL_PATHS", "maps,materials,models,sound,particles,scripts,resource"), ",")
+	directories = strings.Split(env("FASTDL_PATHS", "maps,materials,models,sound,particles,scripts,resource,replay"), ",")
+	monitor, err := strconv.Atoi(env("FASTDL_MONITOR_SECONDS", "60"))
+	if err != nil || monitor < 0 {
+		log.Printf("invalid FASTDL_MONITOR_SECONDS: %v\n", err)
+		monitor = 60
+	}
 	servers = make([]*server, 0, 10)
 	failures := 0
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
 	defer func() {
 		for _, s := range servers {
 			s.close()
@@ -500,7 +531,7 @@ func main() {
 		if n == "" {
 			n = u.Hostname()
 		}
-		s := &server{name: n, url: u}
+		s := &server{name: n, url: u, ctx: ctx}
 		if _, err := s.connect(nil); err != nil {
 			log.Printf("failed to connect to %s: %v\n", n, err)
 			failures++
@@ -513,10 +544,20 @@ func main() {
 		log.Printf("failed to connect to %d servers\n", failures)
 		return
 	}
+	if monitor > 0 {
+		for _, s := range servers {
+			go s.monitor(time.Duration(monitor)*time.Second, cancel)
+		}
+	}
 	bind := env("FASTDL_BIND", ":8080")
 	log.Printf("listening on %s\n", bind)
-	if err := http.ListenAndServe(bind, http.HandlerFunc(serve)); err != nil {
+	h := &http.Server{
+		Addr: bind,
+		Handler: http.HandlerFunc(serve),
+		BaseContext: func(l net.Listener) context.Context { return ctx },
+	}
+	if err := h.ListenAndServe(); err != nil {
 		log.Printf("listen failed: %v\n", err)
-		time.Sleep(3 * time.Second)
+		time.Sleep(3*time.Second)
 	}
 }
