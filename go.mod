@@ -1,4 +1,4 @@
-module github.com/luavixen/loserpuppy-fastdl
+module git.vixen.computer/lua/foxfastdl
 
 go 1.24.5
 

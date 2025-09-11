@@ -328,7 +328,7 @@ func compile() {
     {{end}}
     <tr><th colspan="3"><hr></th></tr>
   </table>
-  <p>Powered by <a href="https://github.com/luavixen/foxfastdl">foxfastdl</a> &#128062;</p>
+  <p>Powered by <a href="https://git.vixen.computer/lua/foxfastdl">foxfastdl</a> &#128062;</p>
 </body>
 </html>
 `
